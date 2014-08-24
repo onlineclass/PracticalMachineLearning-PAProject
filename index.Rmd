@@ -1,0 +1,341 @@
+---
+output:
+  html_document:
+    keep_md: yes
+---
+## Practical Machine Learning Project - HAR data analysis
+
+### 1. Synopsis
+
+This document presents the details of the data analysis performed for the 
+peer-assessed project of the Practical Machine Learning class.   
+The project requires the development of a **predictive model** to be trained on 
+a training data set and applied to a test data set with unknown outcomes.   
+The details of the problem - **HAR (Human Activity Recognition)** - can be found 
+at the [HAR web site](http://groupware.les.inf.puc-rio.br/har).   
+The prediction represents a tipical **multi-class classification** machine 
+learning problem.   
+This HTML documents has been generated using the **knitr** package from an 
+R Marknown source and contains all data analysis code (although not echoed).   
+
+### 2. Data Analysis
+
+#### 2.1 Required libraries
+
+The libraries required for the  analysis are: 
+
+* `caret` - Classification and Regression Testing    
+* `gbm` - Generalized Boosted Regression Models    
+* `nnet` - Feed-forward Neural Networks and Multinomial Log-Linear Models    
+* `ROCR` - Scoring Classifiers Performance Visualization    
+* `doMC` - Foreach parallel adaptor for the multicore package    
+
+```{r, echo=FALSE, results='hide'}
+suppressPackageStartupMessages(library(xtable))
+suppressPackageStartupMessages(library(caret))
+suppressPackageStartupMessages(library(gbm))
+suppressPackageStartupMessages(library(plyr))
+suppressPackageStartupMessages(library(nnet))
+suppressPackageStartupMessages(library(ROCR))
+suppressPackageStartupMessages(library(doMC))
+
+# Set the number of CPU cores to do the calculations and init the RNG
+registerDoMC(4)
+set.seed(111)
+
+```
+
+#### 2.2 Data pre-processing
+
+The following steps have been performed to process the original training and 
+testing data sets:   
+
+* load the raw data sets from the files **pml-training.csv** and **pml-testing.csv**    
+* remove from the raw data sets all columns that have NA values and the columns 1 (row ID) and 3 to 7 (timestamps and windo ID and flags)    
+* split each of the data sets by the **user_name**. The result will be a training and a testing list, each with 6 data frame elements    
+* remove the **0-variance** (constant) columns (if any) from each element of the training and testing lists   
+* split the training set list in 2 different lists using the `createDataPartition` function from the `caret` package. The first list (larger) will be used to **train each model** and the second list (smaller) will be used to **estimate the out-of-sample error** of each trained model     
+
+```{r,echo=FALSE,results='hide'}
+# Load the testing data set
+raw.test.data <- read.csv("pml-testing.csv", stringsAsFactors = F)
+raw.train.data <- read.csv("pml-training.csv", stringsAsFactors = F)
+
+# Remove all columns from test and train data sets that have NA values and the 
+# columns 1 and 3:7
+test.data <- raw.test.data[,0 == as.vector(apply(raw.test.data, 2, 
+                                                 function(x) sum(is.na(x))))]
+train.data <- raw.train.data[,c(names(test.data)[
+    names(test.data) %in% names(raw.train.data)], "classe")]
+test.data <- test.data[,c(-1,-3:-7)]
+train.data <- train.data[,c(-1,-3:-7)]
+
+test.data$user_name <- as.factor(test.data$user_name)
+train.data$user_name <- as.factor(train.data$user_name)
+train.data$classe <- as.factor(train.data$classe)
+
+# Discard the raw data
+rm(raw.test.data)
+rm(raw.train.data)
+
+# Split train.data and test.data by the "user_name"
+train.list <- split(train.data, train.data$user_name, drop = F)
+test.list <- split(test.data, test.data$user_name, drop = F)
+train.names <- names(train.list)
+test.names <- names(test.list)
+
+# Remove the first column (user_name) from each element of the 2 lists
+f.col.remove <- function(x) x[,2:ncol(x)]
+train.list <- lapply(train.list, f.col.remove)
+test.list <- lapply(test.list, f.col.remove)
+
+# Next we remove the 0-variance (constant) columns (if any) from each element 
+# of the train and test lists
+# Remove 0-var columns function. !!! MUST BE APPLIED TO THE TEST LIST FIRST !!!
+f.zerovar.remove <- function(x, y, z) 
+    y[[x]][,c(apply(z[[x]][,-ncol(z[[x]])], 2, var) >= 0.00001, T)]
+element.ndx <- 1:length(train.list)
+test.list <- lapply(element.ndx, f.zerovar.remove, y = test.list, 
+                    z = train.list)
+train.list <- lapply(element.ndx, f.zerovar.remove, y = train.list, 
+                     z = train.list)
+names(train.list) <- train.names
+names(test.list) <- test.names
+
+# Create a list with the row selections for the training and testing sets
+f.select.train.row <- function(x) 
+    createDataPartition(y = x$classe, p = 0.75, list = F)
+inTrain.list <- lapply(train.list, f.select.train.row)
+# Create 2 lists with the partitions of the training data - one for the train 
+# and the other for test
+f.create.partition <- function(x, y) 
+    if (y == "train") {
+        train.list[[x]][inTrain.list[[x]],] 
+    } else {
+        train.list[[x]][-inTrain.list[[x]],]
+    }
+training.set.list <- lapply(element.ndx, f.create.partition, y = "train")
+testing.set.list <- lapply(element.ndx, f.create.partition, y = "test")
+names(training.set.list) <- train.names
+names(testing.set.list) <- train.names
+
+```
+
+#### 2.3 Model training
+
+The following three different models have been trained on the training list:    
+
+* **gbm** - **Gradiend Boosting** model trained using the `train` function from the caret package with `method = "gbm"` and one parameter - `verbose = FALSE`    
+* **knn** - **k-Nearest Neighbors** model trained using the `train` function with `method = "knn"` and no additional parameters    
+* **nnet** - **Feeed-forward Neural Networks** using the `nnet` function from the `nnet` package with 4 parameters - `size = 4`, `maxit = 5000`, `trace = FALSE` and `decay = 0.1`    
+
+During the initial analysis of the data sets, the **Random Forests** model has been used but it has been removed from the final data analysis for performance considerations - it takes a much longer time to train the Random Forests model compared with the above three models and the results are almost identical with two of the above models.    
+
+```{r,echo=FALSE,results='hide'}
+# Now we can start training the Gradient Boosting, k-Nearest Neighbors and 
+# Neural Networks models
+# TRAIN.1 - train the Gradient Boosting model for each element of 
+# 'training.set.list'
+f.gbm.train <- function(x) 
+    train(classe ~ ., data = x, method = "gbm", verbose = F)
+gbmFit.list <- lapply(training.set.list, f.gbm.train)
+names(gbmFit.list) <- train.names
+
+# TRAIN.2 - train the k-Nearest Neighbors model for each element of 
+# 'training.set.list'
+f.knn.train <- function(x) train(classe ~ ., data = x, method = "knn")
+knnFit.list <- lapply(training.set.list, f.knn.train)
+names(knnFit.list) <- train.names
+
+# TRAIN.3 - train the Random Forest model for each element of 
+# 'training.set.list'
+f.nnet.train <- function(x) nnet(classe ~ ., data = x, size = 4, maxit = 5000, 
+                                 trace = F, decay = 0.1)
+nnetFit.list <- lapply(training.set.list, f.nnet.train)
+names(nnetFit.list) <- train.names
+
+# Estimate the out-of-sample error by generating the confusion matrix on the 
+# testing data sets
+f.testing.set.pred <- function(k, x, y, ...) 
+    table(predict(x[[k]], y[[k]], ...), y[[k]]$classe)
+
+```
+
+#### 2.4 Model performance - out-of-sample error estimate
+
+```{r, echo=FALSE,results='hide'}
+## CONF.MATRIX.1 - Gradient Boosting
+gbm.accuracy.table.list <- lapply(element.ndx, f.testing.set.pred, 
+                                  x = gbmFit.list, y = testing.set.list)
+names(gbm.accuracy.table.list) <- train.names
+
+## CONF.MATRIX.2 - k-Nearest Neighbors
+knn.accuracy.table.list <- lapply(element.ndx, f.testing.set.pred, 
+                                  x = knnFit.list, y = testing.set.list)
+names(knn.accuracy.table.list) <- train.names
+
+## CONF.MATRIX.3 - Neural Networks
+nnet.accuracy.table.list <- lapply(element.ndx, f.testing.set.pred, 
+                                   x = nnetFit.list, y = testing.set.list, 
+                                   type = "class")
+names(nnet.accuracy.table.list) <- train.names
+```
+
+The performance of the three models has been estimated on the test list created during the data pre-processing stage.    
+Below are the confusion matrices created for each model and for user **Jeremy**:    
+
+##### Gradient Boosting model confusion matrix for user "jeremy"    
+```{r, echo=FALSE, results='asis'}
+print(xtable(gbm.accuracy.table.list[[5]]),type="html")
+```     
+    
+##### k-Nearest Neighbors model confusion matrix for user "jeremy"    
+```{r, echo=FALSE, results='asis'}
+print(xtable(knn.accuracy.table.list[[5]]),type="html")
+```     
+    
+##### Neural Networks model confusion matrix for user "jeremy"    
+```{r, echo=FALSE, results='asis'}
+print(xtable(nnet.accuracy.table.list[[5]]),type="html")
+```    
+    
+The following bar graph shows the minimum accuracy level of each of the three models for each element (user) of the testing list:    
+    
+```{r minimum_model_accuracy,echo=FALSE,results='hide',fig.align='left',fig.width=11,fig.height=9}
+# Generate the predition probabilities to be used for generating the ROC curves
+f.testing.set.prob.pred <- function(k, x, y, ...) 
+    predict(x[[k]], y[[k]], ...)
+
+# PRED.PROB.1 - Gradient Boosting
+gbm.pred.prob.list <- lapply(element.ndx, f.testing.set.prob.pred, 
+                             x = gbmFit.list, y = testing.set.list, 
+                             type = "prob")
+names(gbm.pred.prob.list) <- train.names
+
+# PRED.PROB.2 - k-Nearest Neighbors
+knn.pred.prob.list <- lapply(element.ndx, f.testing.set.prob.pred, 
+                             x = knnFit.list, y = testing.set.list, 
+                             type = "prob")
+names(knn.pred.prob.list) <- train.names
+
+# PRED.PROB.3 - Neural Networks
+nnet.pred.prob.list <- lapply(element.ndx, f.testing.set.prob.pred, 
+                              x = nnetFit.list, y = testing.set.list, 
+                              type = "raw")
+names(nnet.pred.prob.list) <- train.names
+
+## Generate the minimum accuracy for the elements of the accuracy table lists 
+## for each model. This will be used in model selection
+f.min.accuracy <- function(x) min(diag(x) / colSums(x))
+
+## MIN.ACC.1 - Random Forests
+gbm.accuracy.vec <- sapply(gbm.accuracy.table.list, f.min.accuracy)
+
+## MIN.ACC.2 - k-Nearest Neighbors
+knn.accuracy.vec <- sapply(knn.accuracy.table.list, f.min.accuracy)
+
+## MIN.ACC.3 - Neural Networks
+nnet.accuracy.vec <- sapply(nnet.accuracy.table.list, f.min.accuracy)
+
+## Plot the minimum accuracy level of the models for each user
+acc.bar.height <- t(as.matrix(data.frame(gbm = gbm.accuracy.vec, 
+                                         knn = knn.accuracy.vec,
+                                         nnet = nnet.accuracy.vec)))
+barplot(acc.bar.height, beside = T, names.arg = names(gbm.accuracy.vec), 
+        xlab = "User", ylab = "Accuracy", ylim = c(0,1.14),
+        main = "Minimum accuracy", 
+        col = c("#8800FFBB", "#FFBB00BB", "#FF0000BB"), 
+        legend.text = 
+            c("Gradient Boosting", "k-Nearest Neighbors", "Neural Networks"), 
+        args.legend = list(x = "topright"))
+
+```
+
+As it can be seen from the plot above, all models perform very well but the **Gradient Boosting** model has an accuracy close to 100%
+
+Same conclusion can be reached from the ROC curves plotted in the followin graph:    
+    
+```{r roc_curves,echo=FALSE,results='hide',fig.height=9,fig.width=11}
+
+# Plot the ROC curves for classe = "C" and user = "jeremy"
+gbm.df.prob <- data.frame(C = gbm.pred.prob.list$jeremy[,3])
+gbm.df.prob <- data.frame(gbm.df.prob, 
+                          Other = rep(1, nrow(gbm.df.prob)) - gbm.df.prob$C)
+gbm.df.prob <- data.frame(gbm.df.prob, 
+                          classe = ifelse(testing.set.list[[5]]$classe == "C", 
+                                          "C", "Other"))                          
+knn.df.prob <- data.frame(C = knn.pred.prob.list$jeremy[,3])
+knn.df.prob <- data.frame(knn.df.prob, 
+                          Other = rep(1, nrow(knn.df.prob)) - knn.df.prob$C)
+knn.df.prob <- data.frame(knn.df.prob, 
+                          classe = ifelse(testing.set.list[[5]]$classe == "C", 
+                                          "C", "Other"))                          
+nnet.df.prob <- data.frame(C = nnet.pred.prob.list$jeremy[,3])
+nnet.df.prob <- data.frame(nnet.df.prob, 
+                           Other = rep(1, nrow(nnet.df.prob)) - nnet.df.prob$C)
+nnet.df.prob <- data.frame(nnet.df.prob, 
+                           classe = ifelse(testing.set.list[[5]]$classe == "C", 
+                                           "C", "Other"))                          
+
+gbm.roc.pred <- prediction(gbm.df.prob$Other, gbm.df.prob$classe)
+gbm.roc.perf <- performance(gbm.roc.pred, "tpr", "fpr")
+knn.roc.pred <- prediction(knn.df.prob$Other, knn.df.prob$classe)
+knn.roc.perf <- performance(knn.roc.pred, "tpr", "fpr")
+nnet.roc.pred <- prediction(nnet.df.prob$Other, nnet.df.prob$classe)
+nnet.roc.perf <- performance(nnet.roc.pred, "tpr", "fpr")
+
+par(mar = c(5, 5, 5, 5))
+par(oma = c(3, 3, 1, 3))
+plot(gbm.roc.perf, col = "red", 
+     main = "Model ROC curves - User = 'Jeremy', classe = 'C'", 
+     xlab = "False Positive Rate", ylab = "True Positive Rate", 
+     lwd = 4, cex = 0.8)
+legend("bottomright", legend = 
+           c("Gradient Boosting", "k-Nearest Neighbors", "Neural Networks"), 
+       col = c("red", "green", "blue"), bty = "n", cex = 0.75, lwd = 4)
+plot(knn.roc.perf, col = "green", lwd = 4, add = T)
+plot(nnet.roc.perf, col = "blue", lwd = 4, add = T)
+
+```    
+     
+### 3. Results - model-based prediction
+             
+```{r,echo=FALSE,results='hide'}
+# Predict the 'classe' value in the test set for each model
+f.pred.test <- function(k, x, y, ...) 
+    data.frame(prediction = predict(x[[k]], y[[k]], ...), 
+               id = y[[k]]$problem_id)
+gbm.pred.test <- lapply(element.ndx, f.pred.test, 
+                        x = gbmFit.list, y = test.list)
+knn.pred.test <- lapply(element.ndx, f.pred.test, 
+                        x = knnFit.list, y = test.list)
+nnet.pred.test <- lapply(element.ndx, f.pred.test, 
+                         x = nnetFit.list, y = test.list, type = "class")
+
+gbm.pred.df <- gbm.pred.test[[1]]
+for (i in 2:length(gbm.pred.test))
+    gbm.pred.df <- rbind(gbm.pred.df, gbm.pred.test[[i]])
+knn.pred.df <- knn.pred.test[[1]]
+for (i in 2:length(knn.pred.test))
+    knn.pred.df <- rbind(knn.pred.df, knn.pred.test[[i]])
+nnet.pred.df <- nnet.pred.test[[1]]
+for (i in 2:length(nnet.pred.test))
+    nnet.pred.df <- rbind(nnet.pred.df, nnet.pred.test[[i]])
+final.prediction <- data.frame(problem_id = gbm.pred.df$id, 
+                               gbm = gbm.pred.df$prediction, 
+                               k_nearest_neighbors = knn.pred.df$prediction,
+                               nnet = nnet.pred.df$prediction)
+final.prediction <- final.prediction[order(final.prediction$problem_id),]
+names(final.prediction) <- c("Problem ID", "Gradient Boosting", 
+                             "k-Nearest Neighbors", "Neural Networks")
+
+```    
+    
+The following table shows the predictions for all problems in the test data set using each of the trained models:    
+    
+```{r,echo=FALSE,results='asis'}
+print(xtable(final.prediction), include.rownames = F, type="html")
+```    
+    
+The **Neural Networks** model makes a different prediction for **problem ID 3** and agrees with the other 2 models on the other problems. The **Gradient Boosting** and the **k-Nearest Neighbors** models **agree on ALL problems**. The prediction result submitted is the one on which the first two models agree (the first 2 columns of the above table).
+
