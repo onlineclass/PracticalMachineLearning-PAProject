@@ -11,6 +11,8 @@ In order to compile the **index.html** file on a local computer you will have to
 #### Performance
 
 The three models trained and tested on the project's data sets (files *pml-training.csv* and *pml-testing.csv*) - **Gradient Boosting**, **k-Nearest Neighbors** and **Neural Networks** - will place a significant load on your local machine and can take a long time.    
+    
 On the machine on which **index.html** was generated (4 cores Intel Xeon CPU at 3.7GHz, Mac OS X 10.9), with 4 cores used via the **doMC** package, it took **472 seconds** to create the output file.    
+    
 You may have to change the **number of cores used by R** from the default 4 (see the `registerDoMC(4)` statement in the index.Rmd file) to a value suitable to your hardware platform.    
 
